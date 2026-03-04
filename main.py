@@ -3,393 +3,1045 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import os
 import io
-import time
+import re
+import signal
 import logging
 import asyncio
-import zipfile
-from datetime import datetime
+import hashlib
 import urllib.parse
+from html import escape as esc
+from collections import OrderedDict
 
-# ─────────────────────────────────────────────
-# Third-party Imports
-# ─────────────────────────────────────────────
 import aiohttp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, PicklePersistence, filters
+from PIL import Image
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
-
-# Web Server Imports (For the Render Status Page)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 from aiohttp import web
 
 # ─────────────────────────────────────────────
-# Logging Configuration
+# Logging
 # ─────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# HTML LANDING PAGE (The "Website" for Render)
+# Constants
 # ─────────────────────────────────────────────
-HTML_PAGE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Omega Manga Bot - Status</title>
-    <style>
-        body { background-color: #0f172a; color: #e2e8f0; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-        .container { background: #1e293b; padding: 40px; border-radius: 12px; text-align: center; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
-        h1 { color: #38bdf8; }
-        .status { color: #4ade80; font-weight: bold; margin: 20px 0; }
-        a { background: #38bdf8; color: #0f172a; padding: 10px 20px; text-decoration: none; border-radius: 6px; font-weight: bold; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Omega Manga Bot</h1>
-        <div class="status">🟢 All Systems Operational</div>
-        <p>The Telegram Webhook and Bot are actively running.</p>
-        <br>
-        <a href="https://t.me/YOUR_BOT_USERNAME">Open Bot in Telegram</a>
-    </div>
-</body>
-</html>
-"""
+MAX_CB_BYTES = 64
+MAX_PDF_MB = 50
+DL_SEMAPHORE = asyncio.Semaphore(6)
+API_TIMEOUT = aiohttp.ClientTimeout(total=15)
+HEADERS = {"User-Agent": "OmegaMangaBot/2.0"}
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "OmegaMangaBot")
 
 # ─────────────────────────────────────────────
-# API Fetcher Class (Primary + 2 Backups)
+# Memory-capped dictionaries (prevent leaks)
+# ─────────────────────────────────────────────
+class CappedDict(OrderedDict):
+    """OrderedDict that evicts oldest entries at capacity."""
+    def __init__(self, capacity: int = 10_000):
+        super().__init__()
+        self._cap = capacity
+
+    def __setitem__(self, key, value):
+        if key not in self and len(self) >= self._cap:
+            self.popitem(last=False)
+        super().__setitem__(key, value)
+
+
+_id_map = CappedDict(20_000)        # short hash → original id
+_manga_meta = CappedDict(5_000)     # manga short id → {title, source, cover}
+_chapter_meta = CappedDict(20_000)  # chapter short id → {num, manga_title}
+
+
+def shorten(original: str) -> str:
+    if len(original) <= 12:
+        return original
+    short = hashlib.md5(original.encode()).hexdigest()[:12]
+    _id_map[short] = original
+    return short
+
+
+def resolve(short: str) -> str:
+    return _id_map.get(short, short)
+
+
+def sanitize_fn(name: str) -> str:
+    """Remove filesystem-unsafe chars, cap length."""
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name).strip()[:80]
+
+
+# ─────────────────────────────────────────────
+# MangaDex helpers — title & cover extraction
+# ─────────────────────────────────────────────
+# THIS IS THE KEY FIX for "Unknown Title".
+# MangaDex stores titles in the ORIGINAL language.
+# Korean manhwa have {"ko": "..."} with English
+# buried inside altTitles.
+
+def extract_title(item: dict) -> str:
+    """
+    Try, in order:
+      1. Main title dict → en, ja-ro, ko-ro, zh-ro
+      2. altTitles list  → en
+      3. altTitles list  → any romanized
+      4. First available value anywhere
+    """
+    attrs = item.get("attributes", {})
+    titles = attrs.get("title", {})
+    alts = attrs.get("altTitles", [])
+
+    # ── 1. preferred languages in main title ──
+    for lang in ("en", "ja-ro", "ko-ro", "zh-ro"):
+        if titles.get(lang):
+            return titles[lang]
+
+    # ── 2. English in altTitles ──
+    for alt in alts:
+        if isinstance(alt, dict) and alt.get("en"):
+            return alt["en"]
+
+    # ── 3. Romanized in altTitles ──
+    for alt in alts:
+        if isinstance(alt, dict):
+            for lang in ("ja-ro", "ko-ro", "zh-ro"):
+                if alt.get(lang):
+                    return alt[lang]
+
+    # ── 4. Anything at all ──
+    if titles:
+        return next(iter(titles.values()))
+    for alt in alts:
+        if isinstance(alt, dict) and alt:
+            return next(iter(alt.values()))
+
+    return "Unknown Title"
+
+
+def extract_cover(item: dict) -> str | None:
+    """Pull the 512px cover thumbnail URL from includes."""
+    for rel in item.get("relationships", []):
+        if rel.get("type") == "cover_art":
+            fn = rel.get("attributes", {}).get("fileName")
+            if fn:
+                mid = item["id"]
+                return (
+                    f"https://uploads.mangadex.org"
+                    f"/covers/{mid}/{fn}.512.jpg"
+                )
+    return None
+
+
+# ─────────────────────────────────────────────
+# PDF Builder (replaces CBZ/ZIP)
+# ─────────────────────────────────────────────
+def images_to_pdf(
+    raw_pages: list[bytes], filename: str
+) -> io.BytesIO | None:
+    """Convert a list of image bytes into a single PDF."""
+    pil_imgs = []
+    for raw in raw_pages:
+        if raw is None:
+            continue
+        try:
+            img = Image.open(io.BytesIO(raw))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            pil_imgs.append(img)
+        except Exception:
+            continue
+
+    if not pil_imgs:
+        return None
+
+    buf = io.BytesIO()
+    if len(pil_imgs) == 1:
+        pil_imgs[0].save(buf, "PDF")
+    else:
+        pil_imgs[0].save(
+            buf, "PDF", save_all=True, append_images=pil_imgs[1:]
+        )
+    buf.seek(0)
+    buf.name = filename
+    return buf
+
+
+# ─────────────────────────────────────────────
+# HTML Landing Page
+# ─────────────────────────────────────────────
+HTML_PAGE = f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Omega Manga Bot</title>
+<style>
+body{{background:#0f172a;color:#e2e8f0;font-family:system-ui,
+sans-serif;display:flex;align-items:center;justify-content:center;
+height:100vh;margin:0}}
+.c{{background:#1e293b;padding:48px;border-radius:16px;
+text-align:center;box-shadow:0 20px 40px rgba(0,0,0,.5);
+max-width:420px}}
+h1{{color:#38bdf8;margin:0 0 8px}}
+.s{{color:#4ade80;font-weight:700;font-size:1.1em;margin:16px 0}}
+p{{color:#94a3b8;line-height:1.6}}
+a{{display:inline-block;background:#38bdf8;color:#0f172a;
+padding:12px 28px;text-decoration:none;border-radius:8px;
+font-weight:700;margin-top:12px}}
+</style></head>
+<body><div class="c">
+<h1>🌀 Omega Manga Bot</h1>
+<div class="s">🟢 Online</div>
+<p>Search, browse &amp; download manga chapters as PDF
+— directly in Telegram.</p>
+<a href="https://t.me/{BOT_USERNAME}">Open in Telegram</a>
+</div></body></html>"""
+
+
+# ─────────────────────────────────────────────
+# MangaFetcher — Primary + 2 Fallbacks
 # ─────────────────────────────────────────────
 class MangaFetcher:
     def __init__(self):
-        self.session = None
+        self.session: aiohttp.ClientSession | None = None
 
-    async def get_session(self):
+    async def get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            self.session = aiohttp.ClientSession(
+                timeout=API_TIMEOUT, headers=HEADERS
+            )
         return self.session
 
-    # --- 1. SEARCHING & TOP MANHWA ---
-    async def get_top_manga(self):
-        """Fetches top manga using MangaDex as primary."""
+    async def close(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    # ── Normalize source ──────────────────────
+    @staticmethod
+    def _norm(source: str) -> str:
+        # consumet wraps MangaDex IDs
+        return "mdex" if source == "consumet" else source
+
+    # ── TOP MANGA ─────────────────────────────
+    async def get_top_manga(self) -> list[dict]:
         session = await self.get_session()
         try:
-            # Primary: MangaDex
-            url = "https://api.mangadex.org/manga?includes[]=cover_art&order[followedCount]=desc&limit=5&contentRating[]=safe"
-            async with session.get(url, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    results =[]
-                    for item in data['data']:
-                        title = item['attributes']['title'].get('en', 'Unknown Title')
-                        results.append({'id': item['id'], 'title': title, 'source': 'mdex'})
-                    return results
+            url = (
+                "https://api.mangadex.org/manga"
+                "?includes[]=cover_art"
+                "&order[followedCount]=desc"
+                "&limit=5"
+                "&contentRating[]=safe"
+                "&contentRating[]=suggestive"
+                "&availableTranslatedLanguage[]=en"
+            )
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+                return [
+                    {
+                        "id": m["id"],
+                        "title": extract_title(m),
+                        "cover": extract_cover(m),
+                        "source": "mdex",
+                    }
+                    for m in data.get("data", [])
+                ]
         except Exception as e:
-            logger.error(f"Primary API (MangaDex) failed: {e}")
-            
-        # Fallbacks would go here if MangaDex fails to load top manga
-        return[]
+            logger.error(f"Top manga: {e}")
+        return []
 
-    async def search_manga(self, query: str):
-        """Searches with Primary, falls back to Backup 1, then Backup 2."""
+    # ── SEARCH ────────────────────────────────
+    async def search_manga(self, query: str) -> list[dict]:
         session = await self.get_session()
-        
-        # PRIMARY: MangaDex
+        enc = urllib.parse.quote(query)
+
+        # PRIMARY — MangaDex
         try:
-            url = f"https://api.mangadex.org/manga?title={urllib.parse.quote(query)}&limit=5&order[relevance]=desc"
-            async with session.get(url, timeout=8) as resp:
+            url = (
+                f"https://api.mangadex.org/manga"
+                f"?title={enc}&limit=5"
+                f"&order[relevance]=desc"
+                f"&includes[]=cover_art"
+                f"&availableTranslatedLanguage[]=en"
+            )
+            async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if data['data']:
-                        return[{'id': m['id'], 'title': m['attributes']['title'].get('en', 'Unknown'), 'source': 'mdex'} for m in data['data']]
+                    if data.get("data"):
+                        return [
+                            {
+                                "id": m["id"],
+                                "title": extract_title(m),
+                                "cover": extract_cover(m),
+                                "source": "mdex",
+                            }
+                            for m in data["data"]
+                        ]
         except Exception as e:
-            logger.warning(f"MangaDex Search failed: {e}")
+            logger.warning(f"MangaDex search: {e}")
 
-        # BACKUP 1: Comick
+        # BACKUP 1 — Comick
         try:
-            url = f"https://api.comick.cc/v1.0/search?q={urllib.parse.quote(query)}&limit=5"
-            async with session.get(url, timeout=8) as resp:
+            url = (
+                f"https://api.comick.fun/v1.0/search"
+                f"?q={enc}&limit=5"
+            )
+            async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if data:
-                        return [{'id': m['hid'], 'title': m['title'], 'source': 'comick'} for m in data]
+                        return [
+                            {
+                                "id": m["hid"],
+                                "title": m.get("title", "Unknown"),
+                                "cover": None,
+                                "source": "comick",
+                            }
+                            for m in data
+                        ]
         except Exception as e:
-            logger.warning(f"Comick Search failed: {e}")
+            logger.warning(f"Comick search: {e}")
 
-        # BACKUP 2: Consumet API (Placeholder example endpoint)
+        # BACKUP 2 — Consumet
         try:
-            url = f"https://api.consumet.org/manga/mangadex/{urllib.parse.quote(query)}"
-            async with session.get(url, timeout=8) as resp:
+            url = (
+                f"https://api.consumet.org/manga"
+                f"/mangadex/{enc}"
+            )
+            async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if data.get('results'):
-                        return [{'id': m['id'], 'title': m['title'], 'source': 'consumet'} for m in data['results'][:5]]
+                    if data.get("results"):
+                        return [
+                            {
+                                "id": m["id"],
+                                "title": m.get("title", "Unknown"),
+                                "cover": m.get("image"),
+                                "source": "consumet",
+                            }
+                            for m in data["results"][:5]
+                        ]
         except Exception as e:
-            logger.warning(f"Consumet Search failed: {e}")
+            logger.warning(f"Consumet search: {e}")
 
-        return[] # All APIs failed or no results
+        return []
 
-    # --- 2. MANGA DETAILS ---
-    async def get_manga_details(self, manga_id: str, source: str):
+    # ── DETAILS ───────────────────────────────
+    async def get_manga_details(
+        self, manga_id: str, source: str
+    ) -> dict:
+        source = self._norm(source)
         session = await self.get_session()
-        if source == 'mdex':
-            url = f"https://api.mangadex.org/manga/{manga_id}?includes[]=cover_art"
-            async with session.get(url) as resp:
-                data = (await resp.json())['data']
-                desc = data['attributes']['description'].get('en', 'No description.')
-                return desc[:800] + "..." if len(desc) > 800 else desc
-        elif source == 'comick':
-            url = f"https://api.comick.cc/comic/{manga_id}"
-            async with session.get(url) as resp:
-                data = await resp.json()
-                desc = data['comic'].get('desc', 'No description.')
-                return desc[:800] + "..." if len(desc) > 800 else desc
-        return "Description unavailable."
+        out = {
+            "description": "No description available.",
+            "cover_url": None,
+            "title": "Unknown",
+        }
+        try:
+            if source == "mdex":
+                url = (
+                    f"https://api.mangadex.org/manga"
+                    f"/{manga_id}?includes[]=cover_art"
+                )
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        item = (await resp.json())["data"]
+                        out["title"] = extract_title(item)
+                        out["description"] = (
+                            item["attributes"]["description"]
+                            .get("en", "No description.")
+                        )
+                        out["cover_url"] = extract_cover(item)
 
-    # --- 3. CHAPTER LISTING ---
-    async def get_chapters(self, manga_id: str, source: str, offset: int = 0):
+            elif source == "comick":
+                url = (
+                    f"https://api.comick.fun/comic/{manga_id}"
+                )
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        comic = (await resp.json()).get(
+                            "comic", {}
+                        )
+                        out["title"] = comic.get(
+                            "title", "Unknown"
+                        )
+                        out["description"] = comic.get(
+                            "desc", "No description."
+                        )
+                        covers = comic.get("md_covers", [])
+                        if covers:
+                            b2 = covers[0].get("b2key", "")
+                            if b2:
+                                out["cover_url"] = (
+                                    f"https://meo.comick.pictures"
+                                    f"/{b2}"
+                                )
+        except Exception as e:
+            logger.error(f"Details error: {e}")
+        return out
+
+    # ── CHAPTERS ──────────────────────────────
+    async def get_chapters(
+        self, manga_id: str, source: str, offset: int = 0
+    ) -> tuple[list[dict], bool]:
+        source = self._norm(source)
         session = await self.get_session()
         limit = 10
-        if source == 'mdex':
-            url = f"https://api.mangadex.org/manga/{manga_id}/feed?translatedLanguage[]=en&order[chapter]=desc&limit={limit}&offset={offset}"
-            async with session.get(url) as resp:
-                data = await resp.json()
-                chapters =[{'id': c['id'], 'num': c['attributes'].get('chapter', '?')} for c in data['data']]
-                return chapters, data['total'] > (offset + limit)
-        elif source == 'comick':
-            url = f"https://api.comick.cc/comic/{manga_id}/chapters?lang=en&limit={limit}&page={int(offset/limit)+1}"
-            async with session.get(url) as resp:
-                data = await resp.json()
-                chapters = [{'id': c['hid'], 'num': c.get('chap', '?')} for c in data['chapters']]
-                return chapters, len(data['chapters']) == limit
-        return[], False
+        try:
+            if source == "mdex":
+                url = (
+                    f"https://api.mangadex.org/manga"
+                    f"/{manga_id}/feed"
+                    f"?translatedLanguage[]=en"
+                    f"&order[chapter]=desc"
+                    f"&limit={limit}&offset={offset}"
+                )
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        return [], False
+                    data = await resp.json()
+                    chs = [
+                        {
+                            "id": c["id"],
+                            "num": c["attributes"].get(
+                                "chapter", "?"
+                            ),
+                        }
+                        for c in data.get("data", [])
+                    ]
+                    total = data.get("total", 0)
+                    return chs, total > offset + limit
 
-    # --- 4. IMAGE EXTRACTION ---
-    async def get_chapter_images(self, chapter_id: str, source: str):
+            elif source == "comick":
+                page = offset // limit + 1
+                url = (
+                    f"https://api.comick.fun/comic"
+                    f"/{manga_id}/chapters"
+                    f"?lang=en&limit={limit}&page={page}"
+                )
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        return [], False
+                    data = await resp.json()
+                    raw = data.get("chapters", [])
+                    chs = [
+                        {
+                            "id": c["hid"],
+                            "num": c.get("chap", "?"),
+                        }
+                        for c in raw
+                    ]
+                    return chs, len(raw) == limit
+
+        except Exception as e:
+            logger.error(f"Chapters error: {e}")
+        return [], False
+
+    # ── IMAGES ────────────────────────────────
+    async def get_chapter_images(
+        self, chapter_id: str, source: str
+    ) -> list[str]:
+        source = self._norm(source)
         session = await self.get_session()
-        if source == 'mdex':
-            url = f"https://api.mangadex.org/at-home/server/{chapter_id}"
-            async with session.get(url) as resp:
-                data = await resp.json()
-                base = data['baseUrl']
-                hash_id = data['chapter']['hash']
-                return [f"{base}/data/{hash_id}/{img}" for img in data['chapter']['data']]
-        elif source == 'comick':
-            url = f"https://api.comick.cc/chapter/{chapter_id}"
-            async with session.get(url) as resp:
-                data = await resp.json()
-                return [img['url'] for img in data['chapter']['images']]
-        return[]
+        try:
+            if source == "mdex":
+                url = (
+                    f"https://api.mangadex.org/at-home"
+                    f"/server/{chapter_id}"
+                )
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        return []
+                    data = await resp.json()
+                    base = data["baseUrl"]
+                    h = data["chapter"]["hash"]
+                    return [
+                        f"{base}/data/{h}/{img}"
+                        for img in data["chapter"]["data"]
+                    ]
+
+            elif source == "comick":
+                url = (
+                    f"https://api.comick.fun/chapter"
+                    f"/{chapter_id}"
+                )
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        return []
+                    data = await resp.json()
+                    return [
+                        i["url"]
+                        for i in data.get("chapter", {}).get(
+                            "images", []
+                        )
+                    ]
+        except Exception as e:
+            logger.error(f"Images error: {e}")
+        return []
+
 
 fetcher = MangaFetcher()
 
+
 # ─────────────────────────────────────────────
-# Bot Handlers
+# Telegram Handlers
 # ─────────────────────────────────────────────
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🔄 Fetching top trending Manhwa/Manga...")
-    top_mangas = await fetcher.get_top_manga()
-    
-    text = "👋 *Welcome to Omega Manga Bot!*\n\n🔍 Type any Manga/Manhwa name to search.\n\n🔥 *Top Trending right now:*"
-    keyboard = []
-    for m in top_mangas:
-        keyboard.append([InlineKeyboardButton(m['title'], callback_data=f"manga|{m['source']}|{m['id']}")])
-    
-    await msg.edit_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+async def start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    msg = await update.message.reply_text("⏳ Loading…")
+    top = await fetcher.get_top_manga()
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.message.text.strip()
-    msg = await update.message.reply_text(f"🔍 Searching for `{query}` across multiple sources...", parse_mode='Markdown')
-    
-    results = await fetcher.search_manga(query)
-    
-    if not results:
-        await msg.edit_text("❌ No results found. Try a different name.")
+    text = (
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "    🌀  <b>OMEGA MANGA BOT</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Send any title to search &amp; download\n"
+        "chapters as <b>PDF</b> instantly.\n\n"
+        "🔥  <b>Trending Now</b>\n"
+        "─────────────────────"
+    )
+
+    kb = []
+    for i, m in enumerate(top, 1):
+        sid = shorten(m["id"])
+        _manga_meta[sid] = {
+            "title": m["title"],
+            "source": m["source"],
+            "cover": m.get("cover"),
+        }
+        cb = f"m|{m['source']}|{sid}"
+        if len(cb.encode()) <= MAX_CB_BYTES:
+            kb.append(
+                [
+                    InlineKeyboardButton(
+                        f"{i}.  {m['title']}",
+                        callback_data=cb,
+                    )
+                ]
+            )
+
+    await msg.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+
+async def help_cmd(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    await update.message.reply_text(
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "    ❓  <b>HOW TO USE</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "1️⃣  Type any manga / manhwa name\n"
+        "2️⃣  Select a result from the list\n"
+        "3️⃣  Tap a chapter to download\n"
+        "4️⃣  Receive it as a <b>PDF</b> file\n\n"
+        "📌  <b>Sources:</b>  MangaDex · Comick\n"
+        "📎  <b>Format:</b>  "
+        "<code>Title - Chapter X.pdf</code>",
+        parse_mode="HTML",
+    )
+
+
+async def handle_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    q = update.message.text.strip()
+    if not q:
         return
-        
-    keyboard =[]
-    for m in results:
-        keyboard.append([InlineKeyboardButton(m['title'], callback_data=f"manga|{m['source']}|{m['id']}")])
-        
-    await msg.edit_text("✅ *Results Found:*\nSelect one to view chapters:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text(
+        f"🔍  Searching  <b>{esc(q)}</b> …",
+        parse_mode="HTML",
+    )
+
+    results = await fetcher.search_manga(q)
+
+    if not results:
+        await msg.edit_text(
+            "❌  <b>No results found.</b>\n\n"
+            "<i>Try a different spelling or "
+            "the original title.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    kb = []
+    for m in results:
+        sid = shorten(m["id"])
+        _manga_meta[sid] = {
+            "title": m["title"],
+            "source": m["source"],
+            "cover": m.get("cover"),
+        }
+        cb = f"m|{m['source']}|{sid}"
+        if len(cb.encode()) <= MAX_CB_BYTES:
+            kb.append(
+                [
+                    InlineKeyboardButton(
+                        f"📖  {m['title']}",
+                        callback_data=cb,
+                    )
+                ]
+            )
+
+    await msg.edit_text(
+        f"✅  <b>Results for</b>  \"{esc(q)}\"\n"
+        "─────────────────────\n"
+        "Tap a title to view chapters:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+
+# ─────────────────────────────────────────────
+# Callback Router
+# ─────────────────────────────────────────────
+
+async def button_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
     query = update.callback_query
     await query.answer()
-    data = query.data.split('|')
-    action = data[0]
+    parts = query.data.split("|")
+    action = parts[0]
 
-    # --- SHOW MANGA DETAILS & CHAPTERS ---
-    if action == 'manga':
-        source, manga_id = data[1], data[2]
-        await query.edit_message_text("⏳ Loading description and chapters...")
-        
-        desc = await fetcher.get_manga_details(manga_id, source)
-        chapters, has_next = await fetcher.get_chapters(manga_id, source, 0)
-        
-        text = f"📖 *Description:*\n{desc}\n\n📚 *Select a Chapter:*"
-        keyboard = []
-        for ch in chapters:
-            keyboard.append([InlineKeyboardButton(f"Chapter {ch['num']}", callback_data=f"dl|{source}|{ch['id']}")])
-            
-        if has_next:
-            keyboard.append([InlineKeyboardButton("Next Page ➡️", callback_data=f"page|{source}|{manga_id}|10")])
-            
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    try:
+        # ── View manga details ────────────────
+        if action == "m" and len(parts) == 3:
+            source, sid = parts[1], parts[2]
+            manga_id = resolve(sid)
+            meta = _manga_meta.get(sid, {})
+            stored_title = meta.get("title", "Unknown")
+            chat_id = query.message.chat_id
 
-    # --- PAGINATION ---
-    elif action == 'page':
-        source, manga_id, offset = data[1], data[2], int(data[3])
-        chapters, has_next = await fetcher.get_chapters(manga_id, source, offset)
-        
-        keyboard =[]
-        for ch in chapters:
-            keyboard.append([InlineKeyboardButton(f"Chapter {ch['num']}", callback_data=f"dl|{source}|{ch['id']}")])
-            
-        nav_row =[]
-        if offset > 0:
-            nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page|{source}|{manga_id}|{max(0, offset-10)}"))
-        if has_next:
-            nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"page|{source}|{manga_id}|{offset+10}"))
-            
-        if nav_row:
-            keyboard.append(nav_row)
-            
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+            # delete old message (search results)
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
 
-    # --- DOWNLOAD & SEND CHAPTER ---
-    elif action == 'dl':
-        source, chapter_id = data[1], data[2]
-        status_msg = await query.message.reply_text("📥 Extracting images... Please wait.")
-        
-        image_urls = await fetcher.get_chapter_images(chapter_id, source)
-        if not image_urls:
-            await status_msg.edit_text("❌ Failed to fetch chapter images. They might be paywalled or unavailable.")
-            return
+            loading = await context.bot.send_message(
+                chat_id,
+                "⏳  Loading details …",
+            )
 
-        await status_msg.edit_text(f"⏳ Downloading {len(image_urls)} images...")
-        
-        # Download images concurrently into a zip file in memory
-        session = await fetcher.get_session()
-        zip_buffer = io.BytesIO()
-        zip_buffer.name = f"Chapter_{chapter_id}.cbz" # CBZ is standard comic book format
-        
-        async def fetch_image(idx, url):
+            details, (chapters, has_next) = (
+                await asyncio.gather(
+                    fetcher.get_manga_details(
+                        manga_id, source
+                    ),
+                    fetcher.get_chapters(
+                        manga_id, source, 0
+                    ),
+                )
+            )
+
+            title = details.get("title") or stored_title
+            desc = details.get(
+                "description", "No description."
+            )
+            cover = (
+                details.get("cover_url")
+                or meta.get("cover")
+            )
+
+            # update stored meta
+            _manga_meta[sid] = {
+                "title": title,
+                "source": source,
+                "cover": cover,
+            }
+
+            # truncate description for caption
+            if len(desc) > 450:
+                desc = desc[:450] + "…"
+
+            caption = (
+                f"📖  <b>{esc(title)}</b>\n"
+                f"{'━' * 24}\n\n"
+                f"{esc(desc)}\n\n"
+                f"📚  <b>Chapters</b>  —  "
+                f"tap to download PDF"
+            )
+
+            keyboard = _build_chapter_kb(
+                chapters, source, manga_id, title,
+                0, has_next,
+            )
+
+            await loading.delete()
+
+            # try sending with cover image
+            if cover:
+                try:
+                    await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=cover,
+                        caption=caption,
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup(
+                            keyboard
+                        ),
+                    )
+                    return
+                except Exception as e:
+                    logger.warning(
+                        f"Cover photo failed: {e}"
+                    )
+
+            # fallback: plain text
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=caption,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+
+        # ── Chapter pagination ────────────────
+        elif action == "p" and len(parts) == 4:
+            source, sid = parts[1], parts[2]
+            offset = int(parts[3])
+            manga_id = resolve(sid)
+            meta = _manga_meta.get(sid, {})
+            title = meta.get("title", "Unknown")
+
+            chapters, has_next = await fetcher.get_chapters(
+                manga_id, source, offset
+            )
+            keyboard = _build_chapter_kb(
+                chapters, source, manga_id, title,
+                offset, has_next,
+            )
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        # ── Download chapter as PDF ───────────
+        elif action == "d" and len(parts) == 3:
+            source, ch_sid = parts[1], parts[2]
+            chapter_id = resolve(ch_sid)
+            meta = _chapter_meta.get(ch_sid, {})
+            manga_title = meta.get(
+                "manga_title", "Manga"
+            )
+            chapter_num = meta.get("num", "0")
+
+            await _download_pdf(
+                query, context,
+                chapter_id, source,
+                manga_title, chapter_num,
+            )
+
+    except Exception as e:
+        logger.error(
+            f"button_handler: {e}", exc_info=True
+        )
+        try:
+            await query.message.reply_text(
+                "⚠️  Something went wrong. Try again."
+            )
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────
+# Chapter keyboard builder (2 per row)
+# ─────────────────────────────────────────────
+
+def _build_chapter_kb(
+    chapters: list[dict],
+    source: str,
+    manga_id: str,
+    manga_title: str,
+    offset: int,
+    has_next: bool,
+) -> list[list[InlineKeyboardButton]]:
+    m_sid = shorten(manga_id)
+    kb: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+
+    for ch in chapters:
+        ch_sid = shorten(ch["id"])
+        _chapter_meta[ch_sid] = {
+            "num": ch["num"],
+            "manga_title": manga_title,
+        }
+        cb = f"d|{source}|{ch_sid}"
+        if len(cb.encode()) > MAX_CB_BYTES:
+            continue
+
+        row.append(
+            InlineKeyboardButton(
+                f"📄 Ch. {ch['num']}", callback_data=cb
+            )
+        )
+        if len(row) == 2:          # ← 2 buttons per row
+            kb.append(row)
+            row = []
+
+    if row:
+        kb.append(row)
+
+    # navigation row
+    nav: list[InlineKeyboardButton] = []
+    if offset > 0:
+        cb = f"p|{source}|{m_sid}|{max(0, offset - 10)}"
+        if len(cb.encode()) <= MAX_CB_BYTES:
+            nav.append(
+                InlineKeyboardButton(
+                    "⬅️ Prev", callback_data=cb
+                )
+            )
+    if has_next:
+        cb = f"p|{source}|{m_sid}|{offset + 10}"
+        if len(cb.encode()) <= MAX_CB_BYTES:
+            nav.append(
+                InlineKeyboardButton(
+                    "Next ➡️", callback_data=cb
+                )
+            )
+    if nav:
+        kb.append(nav)
+    return kb
+
+
+# ─────────────────────────────────────────────
+# Download → PDF → Send
+# ─────────────────────────────────────────────
+
+async def _download_pdf(
+    query,
+    context,
+    chapter_id: str,
+    source: str,
+    manga_title: str,
+    chapter_num: str,
+):
+    chat_id = query.message.chat_id
+    safe_title = esc(manga_title)
+    safe_num = esc(str(chapter_num))
+
+    # status card
+    status = await context.bot.send_message(
+        chat_id,
+        (
+            f"{'━' * 24}\n"
+            f"📥  <b>Downloading</b>\n"
+            f"{'━' * 24}\n\n"
+            f"📖  {safe_title}\n"
+            f"📑  Chapter {safe_num}\n\n"
+            f"<code>⏳  Fetching page list …</code>"
+        ),
+        parse_mode="HTML",
+    )
+
+    urls = await fetcher.get_chapter_images(
+        chapter_id, source
+    )
+    if not urls:
+        await status.edit_text(
+            "❌  <b>Failed</b> — images are "
+            "unavailable or paywalled.",
+            parse_mode="HTML",
+        )
+        return
+
+    total = len(urls)
+    await status.edit_text(
+        (
+            f"{'━' * 24}\n"
+            f"📥  <b>Downloading</b>\n"
+            f"{'━' * 24}\n\n"
+            f"📖  {safe_title}\n"
+            f"📑  Chapter {safe_num}\n\n"
+            f"<code>⬇️  Downloading {total} pages …</code>"
+        ),
+        parse_mode="HTML",
+    )
+
+    session = await fetcher.get_session()
+
+    async def _fetch(idx: int, url: str):
+        async with DL_SEMAPHORE:
             try:
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         return idx, await resp.read()
-            except:
+            except Exception:
                 pass
-            return idx, None
+        return idx, None
 
-        tasks =[fetch_image(i, url) for i, url in enumerate(image_urls)]
-        results = await asyncio.gather(*tasks)
-        
-        with zipfile.ZipFile(zip_buffer, 'w') as zipf:
-            for idx, img_data in sorted(results):
-                if img_data:
-                    zipf.writestr(f"{idx:03d}.jpg", img_data)
+    results = await asyncio.gather(
+        *[_fetch(i, u) for i, u in enumerate(urls)]
+    )
 
-        zip_buffer.seek(0)
-        
-        await status_msg.edit_text("📤 Uploading chapter to Telegram...")
-        await context.bot.send_document(
-            chat_id=query.message.chat_id, 
-            document=zip_buffer,
-            caption="✅ Here is your chapter!\n\n*(Note: .cbz files can be opened by comic readers or by renaming to .zip)*",
-            parse_mode='Markdown'
+    # sort, collect, enforce size cap
+    sorted_res = sorted(results)
+    pages: list[bytes] = []
+    cumulative = 0
+    for _, raw in sorted_res:
+        if raw is None:
+            continue
+        cumulative += len(raw)
+        if cumulative > MAX_PDF_MB * 1024 * 1024:
+            break
+        pages.append(raw)
+
+    await status.edit_text(
+        (
+            f"{'━' * 24}\n"
+            f"📥  <b>Downloading</b>\n"
+            f"{'━' * 24}\n\n"
+            f"📖  {safe_title}\n"
+            f"📑  Chapter {safe_num}\n\n"
+            f"<code>📄  Building PDF "
+            f"({len(pages)} pages) …</code>"
+        ),
+        parse_mode="HTML",
+    )
+
+    filename = (
+        f"{sanitize_fn(manga_title)} "
+        f"- Chapter {chapter_num}.pdf"
+    )
+    pdf = images_to_pdf(pages, filename)
+
+    if pdf is None:
+        await status.edit_text(
+            "❌  Could not create PDF. "
+            "All images may have failed to download.",
+            parse_mode="HTML",
         )
-        await status_msg.delete()
+        return
+
+    await status.edit_text(
+        (
+            f"{'━' * 24}\n"
+            f"📥  <b>Downloading</b>\n"
+            f"{'━' * 24}\n\n"
+            f"📖  {safe_title}\n"
+            f"📑  Chapter {safe_num}\n\n"
+            f"<code>📤  Uploading PDF …</code>"
+        ),
+        parse_mode="HTML",
+    )
+
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=pdf,
+        caption=(
+            f"📖  <b>{safe_title}</b>\n"
+            f"📑  Chapter {safe_num}  ·  "
+            f"{len(pages)} pages\n\n"
+            f"<i>@{BOT_USERNAME}</i>"
+        ),
+        parse_mode="HTML",
+    )
+    await status.delete()
 
 
 # ─────────────────────────────────────────────
-# MAIN EXECUTION (Render Webhook Setup)
+# Main — Webhook (Render) or Polling (local)
 # ─────────────────────────────────────────────
 
 async def main():
     TOKEN = os.environ.get("TELEGRAM_TOKEN")
     if not TOKEN:
-        logger.error("❌ No valid bot token found.")
+        logger.error("❌ Set TELEGRAM_TOKEN env var.")
         return
 
     PORT = int(os.environ.get("PORT", "8443"))
-    RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
-    
-    # Setup Bot
-    persistence = PicklePersistence(filepath="bot_data.pkl")
-    application = Application.builder().token(TOKEN).persistence(persistence).build()
+    RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
+    application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND, handle_text
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(button_handler)
+    )
 
-    # Define Web Server Routes
+    # graceful shutdown
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop_event.set)
+
+    # web routes
     async def index_handler(request):
-        return web.Response(text=HTML_PAGE, content_type='text/html')
+        return web.Response(
+            text=HTML_PAGE, content_type="text/html"
+        )
 
     async def webhook_handler(request):
         try:
-            json_data = await request.json()
-            update = Update.de_json(json_data, application.bot)
+            data = await request.json()
+            update = Update.de_json(
+                data, application.bot
+            )
             await application.update_queue.put(update)
             return web.Response()
         except Exception as e:
             logger.error(f"Webhook error: {e}")
             return web.Response(status=500)
 
-    # Boot Process
-    if RENDER_EXTERNAL_URL:
-        await application.initialize()
-        await application.start()
-        
-        webhook_url = f"{RENDER_EXTERNAL_URL}/{TOKEN}"
-        logger.info(f"🌐 Setting webhook to: {webhook_url}")
-        await application.bot.set_webhook(url=webhook_url)
+    await application.initialize()
+    await application.start()
+
+    if RENDER_URL:
+        wh = f"{RENDER_URL}/{TOKEN}"
+        await application.bot.set_webhook(url=wh)
+        logger.info(f"Webhook → {wh}")
 
         web_app = web.Application()
-        web_app.router.add_get('/', index_handler)
-        web_app.router.add_post(f'/{TOKEN}', webhook_handler)
-
+        web_app.router.add_get("/", index_handler)
+        web_app.router.add_post(
+            f"/{TOKEN}", webhook_handler
+        )
         runner = web.AppRunner(web_app)
         await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', PORT)
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
         await site.start()
-        
-        logger.info(f"🚀 Server started on port {PORT}")
-        
-        stop_event = asyncio.Event()
-        try:
-            await stop_event.wait()
-        except (KeyboardInterrupt, SystemExit):
-            pass
-        finally:
-            if fetcher.session:
-                await fetcher.session.close()
-            await application.stop()
-            await application.shutdown()
-            await site.stop()
-            await runner.cleanup()
-    else:
-        logger.info("🔄 Starting polling mode (Local)")
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling()
-        
-        stop_event = asyncio.Event()
+        logger.info(f"🚀 Listening on :{PORT}")
+
         await stop_event.wait()
-        
-        if fetcher.session:
-            await fetcher.session.close()
+        await site.stop()
+        await runner.cleanup()
+    else:
+        logger.info("🔄 Polling mode (local)")
+        await application.updater.start_polling()
+        await stop_event.wait()
         await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+
+    await fetcher.close()
+    await application.stop()
+    await application.shutdown()
+    logger.info("👋 Shutdown complete.")
+
 
 if __name__ == "__main__":
     try:
