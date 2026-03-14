@@ -249,10 +249,10 @@ async def main():
     await site.start()
     logger.info(f"🚀 Web Server started on port {PORT}")
     
+    # Start the app and job queue (WITHOUT POLLING)
     await app.initialize()
     await app.start()
-    await app.updater.start_polling()
-    logger.info("🤖 Bot is now polling and active.")
+    logger.info("🤖 Bot is now active! Broadcast jobs are running.")
 
     # Graceful exit handling
     stop_signal = asyncio.Event()
@@ -264,7 +264,6 @@ async def main():
     await stop_signal.wait()
 
     logger.info("Shutting down...")
-    await app.updater.stop()
     await app.stop()
     await app.shutdown()
     await site.stop()
