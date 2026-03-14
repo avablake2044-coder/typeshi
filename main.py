@@ -1,4 +1,7 @@
 import os
+import io
+import re
+import random
 import signal
 import logging
 import asyncio
@@ -14,8 +17,25 @@ BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 PORT = int(os.environ.get("PORT", "8080"))
 
 CHANNEL_USERNAME = "@zanimeart"
-POST_INTERVAL = 60  # 1 hour in seconds
-SEARCH_TAG = "wonbin_lee"  # Target testing artist
+LOG_GROUP_ID = "-5137021203"  # Your group for storing IDs
+POST_INTERVAL = 3600  # 1 hour in seconds
+
+# Memory to track duplicates
+SEEN_IDS = set()
+
+# 50 High-Quality Artists Similar to wonbin_lee
+ARTISTS =[
+    "wonbin_lee", "torino_aqua", "wlop", "mika_pikazo", "rurudo",
+    "yoneyama_mai", "shirabi", "neco", "lack", "redjuice",
+    "rella", "ryota-h", "so-bin", "tiv", "wada_aruko",
+    "modare", "namie", "nardack", "pako", "yoshida_seiji",
+    "ciloranko", "dangmill", "infukun", "kuroboshi_kouhaku", "momoco",
+    "rumoon", "sheng_he", "tcb", "tomioka_jiro", "tsubata_nozomi",
+    "ukumo_uti", "yam_ko", "zumi", "asagi_tosaka", "swd3e2",
+    "gyeong", "hxxg", "m_da_s_tarou", "alchemaniac", "anmi",
+    "ask_(askziye)", "chen_bin", "dante_wont_die", "dishwasher1510", "dmyo",
+    "goomrrat", "haori_iori", "hiten_(hitenkei)", "hoshina_(kuzu-kago)", "krenz_cushart"
+]
 
 # Logging setup
 logging.basicConfig(
@@ -24,8 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Single Aiohttp Session headers
-UA = {"User-Agent": "ZAnimeArtBot/1.0"}
+UA = {"User-Agent": "ZAnimeArtBot/2.0"}
 
 # ─────────────────────────────────────────────
 # Tiny Web Site for Render (Health Check)
@@ -51,69 +70,63 @@ HTML_PAGE = f"""<!DOCTYPE html>
         <h1>🎨 ZAnimeArt Bot</h1>
         <div class="status"><div class="dot"></div> Online & Running</div>
         <p>This bot automatically fetches high-quality anime art and broadcasts it to the Telegram channel.</p>
-        <div class="tag">Target: #{SEARCH_TAG}</div>
+        <div class="tag">Tracking {len(ARTISTS)} Premium Artists</div>
         <div class="tag" style="margin-top: 8px;">Channel: {CHANNEL_USERNAME}</div>
     </div>
 </body>
 </html>"""
 
 async def web_index(request):
-    """Returns the simple HTML page so Render knows the app is alive."""
     return web.Response(text=HTML_PAGE, content_type="text/html")
 
 
 # ─────────────────────────────────────────────
-# Danbooru Fetcher & Formatter
+# Tag Cleaning & Formatting Helpers
 # ─────────────────────────────────────────────
-async def fetch_random_danbooru_post(search_tag: str) -> dict:
-    """Fetches a random post from Danbooru using the provided tag."""
-    # Danbooru limits anonymous searches to 2 tags. 
-    # Tag 1: wonbin_lee | Tag 2: rating:general (SFW)
-    url = f"https://danbooru.donmai.us/posts/random.json?tags={search_tag}+rating:general"
-    
-    async with aiohttp.ClientSession(headers=UA) as session:
-        try:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if isinstance(data, dict) and "file_url" in data:
-                        return data
-                else:
-                    logger.error(f"Danbooru API Error: {response.status}")
-        except Exception as e:
-            logger.error(f"Failed to fetch image: {e}")
-    return {}
+def make_hashtag(tag: str) -> str:
+    """Removes brackets, splits by underscore, formats to CamelCase Hashtag."""
+    if not tag or tag.lower() == "unknown":
+        return ""
+    # 1. Strip brackets and everything inside them e.g. "ask_(askziye)" -> "ask_"
+    tag = re.sub(r'\(.*?\)', '', tag)
+    # 2. Split by underscore, capitalize each word for readability
+    parts =[p.capitalize() for p in tag.split('_') if p]
+    joined = "".join(parts)
+    # 3. Strip any remaining special characters
+    clean = re.sub(r'[^a-zA-Z0-9]', '', joined)
+    return f"#{clean}" if clean else ""
 
 def format_post_data(post: dict) -> tuple:
-    """Extracts and formats details like artist, character, links, and hashtags."""
+    """Extracts and formats details into a polished caption."""
     file_url = post.get("file_url")
     large_file_url = post.get("large_file_url", file_url)
 
-    # 1. Extract Details
+    # 1. Extract raw strings
     artist_raw = post.get("tag_string_artist", "Unknown").split()[0]
     character_raw = post.get("tag_string_character", "Original").split()[0]
     
-    artist_name = artist_raw.replace("_", " ").title()
-    character_name = character_raw.replace("_", " ").title()
+    # 2. Clean display names (remove underscores)
+    artist_name = re.sub(r'\(.*?\)', '', artist_raw).replace("_", " ").strip().title()
+    character_name = re.sub(r'\(.*?\)', '', character_raw).replace("_", " ").strip().title()
 
-    # 2. Artist Source Link
+    # 3. Artist Source Link
     source_url = post.get("source")
     if not source_url or not source_url.startswith("http"):
         post_id = post.get("id")
         source_url = f"https://danbooru.donmai.us/posts/{post_id}"
 
-    # 3. Hashtags (Max 3)
-    ht_artist = artist_raw.replace("_", "").replace("-", "")
-    ht_character = character_raw.replace("_", "").replace("-", "")
+    # 4. Clean Hashtags (Max 3)
+    ht_artist = make_hashtag(artist_raw)
+    ht_character = make_hashtag(character_raw)
     
     tags =[]
-    if ht_artist and ht_artist != "unknown": tags.append(f"#{ht_artist}")
-    if ht_character and ht_character != "original": tags.append(f"#{ht_character}")
+    if ht_artist and ht_artist != "#Unknown": tags.append(ht_artist)
+    if ht_character and ht_character != "#Original": tags.append(ht_character)
     tags.append("#AnimeArt")
     
-    hashtags_str = " ".join(tags[:3]) # Limit strictly to 3 tags
+    hashtags_str = " ".join(tags[:3]) # Enforce max 3 tags
 
-    # 4. Styled Caption
+    # 5. Build Caption
     caption = (
         f"🎨 <b>Artist:</b> <a href='{source_url}'>{artist_name}</a>\n"
         f"👤 <b>Character:</b> {character_name}\n\n"
@@ -125,21 +138,49 @@ def format_post_data(post: dict) -> tuple:
 
 
 # ─────────────────────────────────────────────
+# Danbooru Fetcher
+# ─────────────────────────────────────────────
+async def fetch_random_danbooru_post(search_tag: str) -> dict:
+    """Fetches up to 10 random posts and returns the first one that is NOT a duplicate."""
+    # We fetch a batch of 10 to easily skip duplicates
+    url = f"https://danbooru.donmai.us/posts.json?tags={search_tag}+rating:general&random=true&limit=10"
+    
+    async with aiohttp.ClientSession(headers=UA) as session:
+        try:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if isinstance(data, list):
+                        for post in data:
+                            post_id = str(post.get("id"))
+                            # Return the first post that has a file and isn't a duplicate
+                            if "file_url" in post and post_id not in SEEN_IDS:
+                                return post
+                else:
+                    logger.error(f"Danbooru API Error: {response.status}")
+        except Exception as e:
+            logger.error(f"Failed to fetch image: {e}")
+    return {}
+
+
+# ─────────────────────────────────────────────
 # Scheduled Job
 # ─────────────────────────────────────────────
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
-    """Fetches and posts the image to the channel."""
-    logger.info(f"Fetching new art for {SEARCH_TAG}...")
+    """Fetches, posts the image, and logs the ID to avoid duplicates."""
+    target_artist = random.choice(ARTISTS)
+    logger.info(f"Fetching new art for randomly chosen artist: {target_artist}...")
     
-    post = await fetch_random_danbooru_post(SEARCH_TAG)
+    post = await fetch_random_danbooru_post(target_artist)
     if not post:
-        logger.warning("No valid post found. Skipping this cycle.")
+        logger.warning(f"No valid/unique post found for {target_artist}. Skipping this cycle.")
         return
 
+    post_id = str(post.get("id"))
     file_url, large_file_url, caption = format_post_data(post)
 
     try:
-        # Message 1: The Broadcast Photo (optimized for viewing)
+        # 1. Send Broadcast Photo
         await context.bot.send_photo(
             chat_id=CHANNEL_USERNAME,
             photo=large_file_url,
@@ -147,7 +188,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
         
-        # Message 2: The Full Quality File Document (uncompressed)
+        # 2. Send Uncompressed File Document
         await context.bot.send_document(
             chat_id=CHANNEL_USERNAME,
             document=file_url,
@@ -155,7 +196,29 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
         
-        logger.info("Successfully posted image and document to channel!")
+        # 3. Add to Database & Sync with Log Group
+        SEEN_IDS.add(post_id)
+        
+        # Create an in-memory text file containing all IDs separated by commas
+        ids_string = ",".join(SEEN_IDS)
+        file_bytes = io.BytesIO(ids_string.encode('utf-8'))
+        file_bytes.name = "posted_ids_database.txt"
+
+        log_caption = (
+            f"✅ <b>New Image Posted</b>\n"
+            f"ID: <code>{post_id}</code>\n"
+            f"Artist tag: {target_artist}\n\n"
+            f"📦 <i>Attached is the updated database of all {len(SEEN_IDS)} unique IDs posted so far.</i>"
+        )
+
+        await context.bot.send_document(
+            chat_id=LOG_GROUP_ID,
+            document=file_bytes,
+            caption=log_caption,
+            parse_mode=ParseMode.HTML
+        )
+        
+        logger.info(f"Successfully posted {post_id} to channel and synced DB!")
         
     except Exception as e:
         logger.error(f"Error posting to Telegram: {e}")
@@ -169,24 +232,20 @@ async def main():
         logger.error("TELEGRAM_TOKEN is missing! Set it in your environment variables.")
         return
 
-    # 1. Setup Telegram Bot Application
+    # Initialize Telegram App
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Schedule the auto-post job
     job_queue = app.job_queue
     logger.info(f"Scheduling auto-post every {POST_INTERVAL} seconds...")
-    # 'first=10' means it will make its first post 10 seconds after starting
     job_queue.run_repeating(auto_post_job, interval=POST_INTERVAL, first=10)
 
-    # 2. Setup Aiohttp Web Server
+    # Initialize Web Server for Render Health checks
     web_app = web.Application()
     web_app.router.add_get("/", web_index)
-    
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     
-    # Start both the Web Server and the Bot
     await site.start()
     logger.info(f"🚀 Web Server started on port {PORT}")
     
@@ -195,7 +254,7 @@ async def main():
     await app.updater.start_polling()
     logger.info("🤖 Bot is now polling and active.")
 
-    # 3. Keep the loop running until stopped manually or by Render
+    # Graceful exit handling
     stop_signal = asyncio.Event()
     loop = asyncio.get_running_loop()
     
@@ -204,7 +263,6 @@ async def main():
 
     await stop_signal.wait()
 
-    # 4. Graceful Shutdown
     logger.info("Shutting down...")
     await app.updater.stop()
     await app.stop()
