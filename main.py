@@ -18,7 +18,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 CHANNEL_USERNAME = "@zanimeart"
 LOG_GROUP_ID = "-5137021203"  # Your group for storing IDs
-POST_INTERVAL = 3600  # 1 hour in seconds
+POST_INTERVAL = 900  # 1 hour in seconds
 
 # Memory to track duplicates
 SEEN_IDS = set()
