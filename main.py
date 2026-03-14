@@ -54,7 +54,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-UA = {"User-Agent": "ZAnimeArtBot/3.0"}
+UA = {"User-Agent": "ZAnimeArtBot/3.1"}
 
 # ─────────────────────────────────────────────
 # Tiny Web Site for Render (Health Check)
@@ -98,7 +98,7 @@ def make_hashtag(tag: str) -> str:
     if not tag or tag.lower() == "unknown":
         return ""
     tag = re.sub(r'\(.*?\)', '', tag)
-    parts =[p.capitalize() for p in tag.split('_') if p]
+    parts = [p.capitalize() for p in tag.split('_') if p]
     joined = "".join(parts)
     clean = re.sub(r'[^a-zA-Z0-9]', '', joined)
     return f"#{clean}" if clean else ""
@@ -108,17 +108,25 @@ def format_post_data(post: dict) -> tuple:
     file_url = post.get("file_url")
     large_file_url = post.get("large_file_url", file_url)
 
-    artist_raw = post.get("tag_string_artist", "Unknown").split()[0]
-    character_raw = post.get("tag_string_character", "Original").split()[0]
+    # 1. Safely extract strings (Danbooru returns "" if empty)
+    artist_str = post.get("tag_string_artist", "")
+    character_str = post.get("tag_string_character", "")
     
+    # 2. Safely get the first tag, or apply a default if it's completely empty
+    artist_raw = artist_str.split()[0] if artist_str.strip() else "Unknown"
+    character_raw = character_str.split()[0] if character_str.strip() else "Original"
+
+    # 3. Clean display names (remove underscores)
     artist_name = re.sub(r'\(.*?\)', '', artist_raw).replace("_", " ").strip().title()
     character_name = re.sub(r'\(.*?\)', '', character_raw).replace("_", " ").strip().title()
 
+    # 4. Artist Source Link
     source_url = post.get("source")
     if not source_url or not source_url.startswith("http"):
         post_id = post.get("id")
         source_url = f"https://danbooru.donmai.us/posts/{post_id}"
 
+    # 5. Clean Hashtags
     ht_artist = make_hashtag(artist_raw)
     ht_character = make_hashtag(character_raw)
     
@@ -129,6 +137,7 @@ def format_post_data(post: dict) -> tuple:
     
     hashtags_str = " ".join(tags[:3])
 
+    # 6. Build Caption
     caption = (
         f"🎨 <b>Artist:</b> <a href='{source_url}'>{artist_name}</a>\n"
         f"👤 <b>Character:</b> {character_name}\n\n"
