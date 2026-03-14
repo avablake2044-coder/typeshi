@@ -18,23 +18,33 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 CHANNEL_USERNAME = "@zanimeart"
 LOG_GROUP_ID = "-5137021203"  # Your group for storing IDs
-POST_INTERVAL = 90 # 1 hour in seconds
+POST_INTERVAL = 90 # 1 hour in seconds (Set to 3600 for 1 hour, 90 is 1.5 mins for testing)
 
 # Memory to track duplicates
 SEEN_IDS = set()
 
-# 50 High-Quality Artists Similar to wonbin_lee
+# 100 Verified High-Quality Artists (200+ posts, SFW-leaning, no bracket aliases)
 ARTISTS =[
-    "wonbin_lee", "torino_aqua", "wlop", "mika_pikazo", "rurudo",
-    "yoneyama_mai", "shirabi", "neco", "lack", "redjuice",
-    "rella", "ryota-h", "so-bin", "tiv", "wada_aruko",
-    "modare", "namie", "nardack", "pako", "yoshida_seiji",
-    "ciloranko", "dangmill", "infukun", "kuroboshi_kouhaku", "momoco",
-    "rumoon", "sheng_he", "tcb", "tomioka_jiro", "tsubata_nozomi",
-    "ukumo_uti", "yam_ko", "zumi", "asagi_tosaka", "swd3e2",
-    "gyeong", "hxxg", "m_da_s_tarou", "alchemaniac", "anmi",
-    "ask_(askziye)", "chen_bin", "dante_wont_die", "dishwasher1510", "dmyo",
-    "goomrrat", "haori_iori", "hiten_(hitenkei)", "hoshina_(kuzu-kago)", "krenz_cushart"
+    "wlop", "mika_pikazo", "rurudo", "yoneyama_mai", "shirabi",
+    "neco", "lack", "redjuice", "rella", "ryota-h",
+    "so-bin", "tiv", "wada_aruko", "namie", "nardack",
+    "pako", "yoshida_seiji", "kuroboshi_kouhaku", "momoco", "tcb",
+    "ukumo_uti", "swd3e2", "hxxg", "alchemaniac", "anmi",
+    "dante_wont_die", "dishwasher1510", "goomrrat", "krenz_cushart", "kantoku",
+    "kurone_mishima", "huke", "misaki_kurehito", "abec", "liduke",
+    "ciloranko", "fuzichoco", "vofan", "loundraw", "kawacy",
+    "saitom", "shunya_yamashita", "mignon", "shigure_ui", "ito_noizi",
+    "tsunako", "namori", "takeuchi_takashi", "koyama_hirokazu", "nanao_naru",
+    "mitsumi_misato", "azuru", "parsley", "shizuma_yoshinori", "ugume",
+    "sakura_koharu", "hisasi", "naoki_saito", "nishizawa_5-miri", "ponkan8",
+    "ukai_saki", "harada_takehito", "soejima_shigenori", "yasuda_suzuhito", "himesuz",
+    "ishikei", "yd", "popman3580", "kakage", "kagura_nana",
+    "ideolo", "cierra", "koyoriin", "gemi", "tomose_shunsaku",
+    "yomu", "daito", "kuwashima_rein", "shibafu", "kincora",
+    "m_da_s_tarou", "paryi", "ninomoto_nino", "mikimoto_haruhiko", "urushihara_satoshi",
+    "yam_ko", "ryou_kameko", "matsuryu", "kikuchi_seiji", "homunculus",
+    "sakimichan", "ask", "torino", "hiten", "tomioka_jiro",
+    "infukun", "dangmill", "rumoon", "sheng_he", "ke-ta"
 ]
 
 # Logging setup
@@ -44,7 +54,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-UA = {"User-Agent": "ZAnimeArtBot/2.0"}
+UA = {"User-Agent": "ZAnimeArtBot/3.0"}
 
 # ─────────────────────────────────────────────
 # Tiny Web Site for Render (Health Check)
@@ -87,12 +97,9 @@ def make_hashtag(tag: str) -> str:
     """Removes brackets, splits by underscore, formats to CamelCase Hashtag."""
     if not tag or tag.lower() == "unknown":
         return ""
-    # 1. Strip brackets and everything inside them e.g. "ask_(askziye)" -> "ask_"
     tag = re.sub(r'\(.*?\)', '', tag)
-    # 2. Split by underscore, capitalize each word for readability
     parts =[p.capitalize() for p in tag.split('_') if p]
     joined = "".join(parts)
-    # 3. Strip any remaining special characters
     clean = re.sub(r'[^a-zA-Z0-9]', '', joined)
     return f"#{clean}" if clean else ""
 
@@ -101,21 +108,17 @@ def format_post_data(post: dict) -> tuple:
     file_url = post.get("file_url")
     large_file_url = post.get("large_file_url", file_url)
 
-    # 1. Extract raw strings
     artist_raw = post.get("tag_string_artist", "Unknown").split()[0]
     character_raw = post.get("tag_string_character", "Original").split()[0]
     
-    # 2. Clean display names (remove underscores)
     artist_name = re.sub(r'\(.*?\)', '', artist_raw).replace("_", " ").strip().title()
     character_name = re.sub(r'\(.*?\)', '', character_raw).replace("_", " ").strip().title()
 
-    # 3. Artist Source Link
     source_url = post.get("source")
     if not source_url or not source_url.startswith("http"):
         post_id = post.get("id")
         source_url = f"https://danbooru.donmai.us/posts/{post_id}"
 
-    # 4. Clean Hashtags (Max 3)
     ht_artist = make_hashtag(artist_raw)
     ht_character = make_hashtag(character_raw)
     
@@ -124,9 +127,8 @@ def format_post_data(post: dict) -> tuple:
     if ht_character and ht_character != "#Original": tags.append(ht_character)
     tags.append("#AnimeArt")
     
-    hashtags_str = " ".join(tags[:3]) # Enforce max 3 tags
+    hashtags_str = " ".join(tags[:3])
 
-    # 5. Build Caption
     caption = (
         f"🎨 <b>Artist:</b> <a href='{source_url}'>{artist_name}</a>\n"
         f"👤 <b>Character:</b> {character_name}\n\n"
@@ -138,11 +140,36 @@ def format_post_data(post: dict) -> tuple:
 
 
 # ─────────────────────────────────────────────
+# Persistence Loader
+# ─────────────────────────────────────────────
+async def load_seen_ids(bot):
+    """Loads previously saved IDs from the pinned database file in the Log Group."""
+    global SEEN_IDS
+    try:
+        chat = await bot.get_chat(LOG_GROUP_ID)
+        if chat.pinned_message and chat.pinned_message.document:
+            file_id = chat.pinned_message.document.file_id
+            tg_file = await bot.get_file(file_id)
+            
+            # Download file from telegram
+            file_bytes = await tg_file.download_as_bytearray()
+            content = file_bytes.decode('utf-8')
+            
+            if content:
+                loaded_ids =[x.strip() for x in content.split(',') if x.strip()]
+                SEEN_IDS.update(loaded_ids)
+                logger.info(f"✅ Successfully restored {len(SEEN_IDS)} IDs from pinned Telegram database.")
+        else:
+            logger.info("ℹ️ No pinned database found in log group. Starting completely fresh.")
+    except Exception as e:
+        logger.error(f"⚠️ Failed to load SEEN_IDS from Telegram. Ensure the bot is an admin in the Log Group! Error: {e}")
+
+
+# ─────────────────────────────────────────────
 # Danbooru Fetcher
 # ─────────────────────────────────────────────
 async def fetch_random_danbooru_post(search_tag: str) -> dict:
     """Fetches up to 10 random posts and returns the first one that is NOT a duplicate."""
-    # We fetch a batch of 10 to easily skip duplicates
     url = f"https://danbooru.donmai.us/posts.json?tags={search_tag}+rating:general&random=true&limit=10"
     
     async with aiohttp.ClientSession(headers=UA) as session:
@@ -153,7 +180,6 @@ async def fetch_random_danbooru_post(search_tag: str) -> dict:
                     if isinstance(data, list):
                         for post in data:
                             post_id = str(post.get("id"))
-                            # Return the first post that has a file and isn't a duplicate
                             if "file_url" in post and post_id not in SEEN_IDS:
                                 return post
                 else:
@@ -199,7 +225,6 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
         # 3. Add to Database & Sync with Log Group
         SEEN_IDS.add(post_id)
         
-        # Create an in-memory text file containing all IDs separated by commas
         ids_string = ",".join(SEEN_IDS)
         file_bytes = io.BytesIO(ids_string.encode('utf-8'))
         file_bytes.name = "posted_ids_database.txt"
@@ -211,12 +236,20 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
             f"📦 <i>Attached is the updated database of all {len(SEEN_IDS)} unique IDs posted so far.</i>"
         )
 
-        await context.bot.send_document(
+        db_message = await context.bot.send_document(
             chat_id=LOG_GROUP_ID,
             document=file_bytes,
             caption=log_caption,
             parse_mode=ParseMode.HTML
         )
+        
+        # 4. PIN THE NEW DATABASE so the bot can find it on restart
+        try:
+            await context.bot.unpin_all_chat_messages(chat_id=LOG_GROUP_ID)
+            await db_message.pin(disable_notification=True)
+            logger.info("📌 Pinned the latest database file for persistence.")
+        except Exception as pin_err:
+            logger.warning(f"⚠️ Could not pin the DB message. Ensure the bot has 'Pin Messages' admin rights in the log group! Error: {pin_err}")
         
         logger.info(f"Successfully posted {post_id} to channel and synced DB!")
         
@@ -234,7 +267,13 @@ async def main():
 
     # Initialize Telegram App
     app = Application.builder().token(BOT_TOKEN).build()
-    
+    await app.initialize()
+
+    # ---- LOAD DATABASE BEFORE STARTING JOBS ----
+    logger.info("Loading previous IDs database from Telegram...")
+    await load_seen_ids(app.bot)
+
+    # Start repeating job
     job_queue = app.job_queue
     logger.info(f"Scheduling auto-post every {POST_INTERVAL} seconds...")
     job_queue.run_repeating(auto_post_job, interval=POST_INTERVAL, first=10)
@@ -250,7 +289,6 @@ async def main():
     logger.info(f"🚀 Web Server started on port {PORT}")
     
     # Start the app and job queue (WITHOUT POLLING)
-    await app.initialize()
     await app.start()
     logger.info("🤖 Bot is now active! Broadcast jobs are running.")
 
