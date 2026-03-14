@@ -141,8 +141,6 @@ def format_post_data(post: dict) -> tuple:
     caption = (
         f"🎨 <b>Artist:</b> <a href='{source_url}'>{artist_name}</a>\n"
         f"👤 <b>Character:</b> {character_name}\n\n"
-        f"{hashtags_str}\n\n"
-        f"✨ <b>Join us:</b> {CHANNEL_USERNAME}"
     )
     
     return file_url, large_file_url, caption
