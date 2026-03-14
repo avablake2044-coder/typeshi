@@ -179,7 +179,7 @@ async def load_seen_ids(bot):
 # ─────────────────────────────────────────────
 async def fetch_random_danbooru_post(search_tag: str) -> dict:
     """Fetches up to 10 random posts and returns the first one that is NOT a duplicate."""
-    url = f"https://danbooru.donmai.us/posts.json?tags={search_tag}+rating:general&random=true&limit=10"
+    url = f"https://danbooru.donmai.us/posts.json?tags={search_tag}+rating:questionable&random=true&limit=10"
     
     async with aiohttp.ClientSession(headers=UA) as session:
         try:
